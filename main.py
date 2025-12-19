@@ -5,8 +5,10 @@ from telebot import custom_filters
 from telebot.util import quick_markup
 from dotenv import load_dotenv
 from googletrans import Translator
+import asyncio
+import nest_asyncio
 
-load_dotenv(override=True)
+nest_asyncio.apply()
 
 # --- Translation System ---
 translations = {
@@ -79,7 +81,7 @@ class BotStates(StatesGroup):
     admin_approval = State()
 
 
-def main():
+async def main():
     bot = telebot.TeleBot(os.environ.get("BOT_TOKEN"), use_class_middlewares=True)
     bot.add_custom_filter(custom_filters.StateFilter(bot))
     translator = Translator()
@@ -171,7 +173,7 @@ def main():
             bot.send_message(message.chat.id, get_text("mod_features_question"))
 
     @bot.callback_query_handler(state=BotStates.translate_description)
-    def translate_description_callback(call):
+    async def translate_description_callback(call):
         user_id = call.from_user.id
         if call.data == 'translate_manual':
             bot.answer_callback_query(call.id, "لقد اخترت: يدوياً")
@@ -184,7 +186,7 @@ def main():
             
             # Perform auto translation
             try:
-                translated = translator.translate(user_data[user_id]['app_description'], dest='en')
+                translated = await translator.translate(user_data[user_id]['app_description'], dest='en')
                 user_data[user_id]['english_description'] = translated.text
             except Exception as e:
                 print(f"Translation error: {e}")
@@ -346,8 +348,8 @@ Download from here ⬇️ {data.get('hashtag')}
         bot.delete_state(user_id)
     
     print("Bot is polling...")
-    bot.infinity_polling(skip_pending=True)
+    await bot.polling(skip_pending=True)
 
 
 if __name__ == "__main__":
-    main()
+    asyncio.run(main())
