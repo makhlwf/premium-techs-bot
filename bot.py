@@ -531,9 +531,10 @@ def ask_confirmation(chat_id, user_id):
 @bot.message_handler(commands=['start'])
 def start_command(message):
     allowed_posters_ids = os.environ.get("ALLOWED_POSTERS_IDS", "").split(',')
-    full_admin_id = os.environ.get("FULL_ADMIN_ID")
+    full_admin_ids = os.environ.get("FULL_ADMIN_ID", "").split(',')
     
-    if str(message.from_user.id) not in allowed_posters_ids and str(message.from_user.id) != full_admin_id:
+    user_id_str = str(message.from_user.id)
+    if user_id_str not in allowed_posters_ids and user_id_str not in full_admin_ids:
         bot.send_message(message.chat.id, get_text("unauthorized"))
         return
     
@@ -1002,16 +1003,23 @@ def confirmation_callback(call):
         bot.edit_message_caption(chat_id=call.message.chat.id, message_id=call.message.message_id, caption=get_text("request_pending"))
         
         # Send to full admin for approval
-        full_admin_id = os.environ.get("FULL_ADMIN_ID")
-        if full_admin_id:
+        full_admin_ids = os.environ.get("FULL_ADMIN_ID", "").split(',')
+        if full_admin_ids:
             data = user_data[user_id]
             admin_message = f"{get_text('new_submission')} {call.from_user.first_name}:\n\n{call.message.caption}"
             markup = quick_markup({
                 get_text("approve_button"): {'callback_data': f'admin_approve_{user_id}'},
                 get_text("reject_button"): {'callback_data': f'admin_reject_{user_id}'}
             }, row_width=2)
-            bot.send_photo(chat_id=full_admin_id, photo=data['app_image'], caption=admin_message, reply_markup=markup)
-            bot.send_document(chat_id=full_admin_id, document=data['app_file'])
+
+            for admin_id in full_admin_ids:
+                if not admin_id.strip():
+                    continue
+                try:
+                    bot.send_photo(chat_id=admin_id, photo=data['app_image'], caption=admin_message, reply_markup=markup)
+                    bot.send_document(chat_id=admin_id, document=data['app_file'])
+                except Exception as e:
+                    print(f"Error sending to admin {admin_id}: {e}")
 
         bot.delete_state(user_id, call.message.chat.id)
 
@@ -1161,19 +1169,14 @@ def admin_approval_callback(call):
     action, user_id_str = call.data.split('_')[1:3]
     user_id = int(user_id_str)
 
-    # Handle missing user_data (restart case)
+    # Check if request is already processed (user_data missing)
     if user_id not in user_data:
-        original_poster_id = user_id # Fallback to user_id as it IS the Telegram ID
-    else:
-        original_poster_id = user_data[user_id].get('original_poster_id')
+        bot.answer_callback_query(call.id, "⛔ This request is closed.")
+        return
+
+    original_poster_id = user_data[user_id].get('original_poster_id')
 
     if action == 'approve':
-        # If user_data is missing, we cannot approve because we don't have the post content.
-
-        if user_id not in user_data:
-            bot.answer_callback_query(call.id, "Error: Data missing due to restart.")
-            return
-
         bot.answer_callback_query(call.id, "Approved")
         bot.edit_message_caption(chat_id=call.message.chat.id, message_id=call.message.message_id, caption="Approved")
         
@@ -1345,6 +1348,15 @@ def admin_rejection_reason_handler(message):
         return
 
     target_user_id = user_data[admin_id]['rejecting_target']
+
+    # Check if request is still valid (not processed by another admin)
+    if target_user_id not in user_data:
+        bot.send_message(message.chat.id, "⛔ Request already processed by another admin.")
+        bot.delete_state(admin_id, message.chat.id)
+        user_data[admin_id].pop('rejecting_target', None)
+        user_data[admin_id].pop('rejecting_message_id', None)
+        return
+
     reject_message_id = user_data[admin_id].get('rejecting_message_id')
     rejection_reason = message.text
 
