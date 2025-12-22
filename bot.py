@@ -534,15 +534,22 @@ def ask_confirmation(chat_id, user_id):
 
 @bot.message_handler(commands=['start'])
 def start_command(message):
-    allowed_posters_ids = os.environ.get("ALLOWED_POSTERS_IDS", "").split(',')
+    allowed_posters_ids = [id.strip() for id in os.environ.get("ALLOWED_POSTERS_IDS", "").split(',') if id.strip()]
     full_admin_ids = get_full_admin_ids()
+    user_id_str = str(message.from_user.id)
     
-    if str(message.from_user.id) not in allowed_posters_ids and str(message.from_user.id) not in full_admin_ids:
+    if user_id_str not in allowed_posters_ids and user_id_str not in full_admin_ids:
         bot.send_message(message.chat.id, get_text("unauthorized"))
         return
     
+    welcome_msg = get_text("welcome")
+    if user_id_str in full_admin_ids:
+        welcome_msg += "\n\nاستمتع بالادارة"
+    elif user_id_str in allowed_posters_ids:
+        welcome_msg += "\n\nاستمتع بالنشر"
+
     markup = quick_markup({get_text("start_button"): {'callback_data': 'start_conversation'}})
-    bot.send_message(message.chat.id, get_text("welcome"), reply_markup=markup, parse_mode='Markdown')
+    bot.send_message(message.chat.id, welcome_msg, reply_markup=markup, parse_mode='Markdown')
 
 @bot.callback_query_handler(func=lambda call: call.data == 'start_conversation')
 def start_conversation_callback(call):
@@ -1309,6 +1316,8 @@ def admin_approval_callback(call):
             bot.send_message(original_poster_id, "✅ Published! Type /start")
 
         bot.delete_state(user_id)
+        if user_id in user_data:
+            del user_data[user_id]
 
     elif action == 'reject':
         admin_id = call.from_user.id
