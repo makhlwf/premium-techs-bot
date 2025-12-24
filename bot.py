@@ -8,6 +8,7 @@ from telebot.types import (
     KeyboardButton,
     InlineKeyboardMarkup,
     InlineKeyboardButton,
+    ReplyKeyboardRemove,
 )
 from dotenv import load_dotenv
 from deep_translator import GoogleTranslator
@@ -54,7 +55,11 @@ translations = {
         "app_image_question_with_url": "الرجاء إرسال صورة التطبيق أو رابط التطبيق على متجر جوجل بلاي.",
         "fetch_error": "الرابط غير صالح أو تعذر استخراج الصورة، الرجاء إرسال الصورة يدوياً.",
         "hashtag_question": "الرجاء اختيار هاشتاج للتطبيق او اكتب هاشتاج من عندك :",
-        "app_file_question": "الرجاء رفع ملف التطبيق.",
+        "app_file_question": "الرجاء رفع ملفات التطبيق. يمكنك إرسال أكثر من ملف (بحد أقصى 10). عند الانتهاء اضغط على '✅ تم'.",
+        "file_received": "✅ تم استلام الملف {count}. أرسل الملف التالي أو اضغط '✅ تم'.",
+        "file_limit_reached": "⚠️ لقد وصلت إلى الحد الأقصى للملفات (10). اضغط '✅ تم' للمتابعة.",
+        "file_missing_warning": "⚠️ الرجاء إرسال ملف واحد على الأقل.",
+        "done_button": "✅ تم",
         "review_prompt": "الرجاء مراجعة المعلومات التي قدمتها:",
         "confirm_button": "تأكيد",
         "restart_button": "إعادة البدء",
@@ -114,6 +119,15 @@ def smart_truncate(text, limit=550):
 def get_back_markup():
     markup = ReplyKeyboardMarkup(resize_keyboard=True, one_time_keyboard=True)
     markup.add(KeyboardButton(get_text("back_button")))
+    return markup
+
+
+def get_done_markup():
+    markup = InlineKeyboardMarkup(row_width=2)
+    markup.add(
+        InlineKeyboardButton(get_text("done_button"), callback_data="files_done"),
+        InlineKeyboardButton(get_text("back_button"), callback_data="go_back"),
+    )
     return markup
 
 
@@ -627,8 +641,16 @@ def ask_hashtag(chat_id, user_id, message_id=None):
 
 def ask_app_file(chat_id, user_id):
     bot.set_state(user_id, BotStates.app_file, chat_id)
+    # Clear previous Reply Keyboard
+    msg = bot.send_message(
+        chat_id,
+        "🔄 جاري تحضير قائمة الملفات...",
+        reply_markup=ReplyKeyboardRemove(),
+    )
+    bot.delete_message(chat_id, msg.message_id)
+
     bot.send_message(
-        chat_id, get_text("app_file_question"), reply_markup=get_back_markup()
+        chat_id, get_text("app_file_question"), reply_markup=get_done_markup()
     )
 
 
@@ -672,6 +694,14 @@ def ask_confirmation(chat_id, user_id):
         caption=confirmation_message,
         reply_markup=markup,
     )
+
+    # Send files to user for verification
+    files = data.get("app_files", [])
+    if not files and "app_file" in data:
+        files = [data["app_file"]]
+
+    for file_id in files:
+        bot.send_document(chat_id=chat_id, document=file_id)
 
 
 # --- Handlers ---
@@ -1193,21 +1223,51 @@ def hashtag_text_handler(message):
     ask_app_image(message.chat.id, user_id)
 
 
+@bot.callback_query_handler(func=lambda call: call.data == "files_done")
+def files_done_callback(call):
+    user_id = call.from_user.id
+    if "app_files" not in user_data[user_id] or not user_data[user_id]["app_files"]:
+        bot.answer_callback_query(call.id, get_text("file_missing_warning"))
+        bot.send_message(
+            call.message.chat.id,
+            get_text("file_missing_warning"),
+            reply_markup=get_done_markup(),
+        )
+        return
+
+    bot.answer_callback_query(call.id)
+    ask_confirmation(call.message.chat.id, user_id)
+
+
 @bot.message_handler(state=BotStates.app_file, content_types=["document", "text"])
 def app_file_handler(message):
     user_id = message.from_user.id
-    if message.content_type == "text" and message.text == get_text("back_button"):
-        go_back(message.chat.id, user_id)
-        return
+
+    # Initialize list if not exists
+    if "app_files" not in user_data[user_id]:
+        user_data[user_id]["app_files"] = []
 
     if message.content_type == "document":
-        user_data[user_id]["app_file"] = message.document.file_id
-        ask_confirmation(message.chat.id, user_id)
+        if len(user_data[user_id]["app_files"]) >= 10:
+            bot.send_message(
+                message.chat.id,
+                get_text("file_limit_reached"),
+                reply_markup=get_done_markup(),
+            )
+        else:
+            user_data[user_id]["app_files"].append(message.document.file_id)
+            count = len(user_data[user_id]["app_files"])
+            bot.send_message(
+                message.chat.id,
+                get_text("file_received").format(count=count),
+                reply_markup=get_done_markup(),
+            )
     else:
+        # If user sends something else (like text)
         bot.send_message(
             message.chat.id,
             get_text("app_file_question"),
-            reply_markup=get_back_markup(),
+            reply_markup=get_done_markup(),
         )
 
 
@@ -1246,6 +1306,11 @@ def confirmation_callback(call):
                 row_width=2,
             )
 
+            # Prepare files list
+            files_to_send = data.get("app_files", [])
+            if not files_to_send and "app_file" in data:
+                files_to_send = [data["app_file"]]
+
             for admin_id in full_admin_ids:
                 if not admin_id.strip():
                     continue
@@ -1256,7 +1321,8 @@ def confirmation_callback(call):
                         caption=admin_message,
                         reply_markup=markup,
                     )
-                    bot.send_document(chat_id=admin_id, document=data["app_file"])
+                    for file_id in files_to_send:
+                        bot.send_document(chat_id=admin_id, document=file_id)
                 except Exception as e:
                     print(f"Error sending to admin {admin_id}: {e}")
 
@@ -1274,6 +1340,7 @@ def confirmation_callback(call):
 
 @bot.callback_query_handler(func=lambda call: call.data == "go_back")
 def go_back_callback(call):
+    bot.answer_callback_query(call.id)
     go_back(call.message.chat.id, call.from_user.id)
 
 
@@ -1401,6 +1468,8 @@ def go_back(chat_id, user_id):
         # From File back to...
         if "app_file" in data:
             del data["app_file"]
+        if "app_files" in data:
+            del data["app_files"]
 
         # Check if Auto-Filled Image exists (Skip Image step) or Manual (Go to Image)
         if data.get("auto_filled") and "app_image" in data:
@@ -1559,39 +1628,56 @@ def admin_approval_callback(call):
             # 5. Assemble
             post_template_en = f"{part_top}\n⚡ Description: {en_desc}\n{part_bottom}"
 
+        # Prepare files list
+        files_to_send = data.get("app_files", [])
+        if not files_to_send and "app_file" in data:
+            files_to_send = [data["app_file"]]
+
         if publish_target == "arabic" or publish_target == "both":
             channel_id = os.environ.get("ARABIC_CHANNEL_ID")
             bot.send_photo(
                 chat_id=channel_id, photo=data["app_image"], caption=post_template_ar
             )
-            sent_doc = bot.send_document(chat_id=channel_id, document=data["app_file"])
-            try:
-                bot.send_poll(
-                    chat_id=channel_id,
-                    question=get_text("poll_question", "ar"),
-                    options=get_text("poll_options", "ar"),
-                    is_anonymous=True,
-                    reply_to_message_id=sent_doc.message_id,
-                )
-            except Exception as e:
-                print(f"Error sending poll: {e}")
+
+            last_msg_id = None
+            for file_id in files_to_send:
+                sent_doc = bot.send_document(chat_id=channel_id, document=file_id)
+                last_msg_id = sent_doc.message_id
+
+            if last_msg_id:
+                try:
+                    bot.send_poll(
+                        chat_id=channel_id,
+                        question=get_text("poll_question", "ar"),
+                        options=get_text("poll_options", "ar"),
+                        is_anonymous=True,
+                        reply_to_message_id=last_msg_id,
+                    )
+                except Exception as e:
+                    print(f"Error sending poll: {e}")
 
         if publish_target == "english" or publish_target == "both":
             channel_id = os.environ.get("ENGLISH_CHANNEL_ID")
             bot.send_photo(
                 chat_id=channel_id, photo=data["app_image"], caption=post_template_en
             )
-            sent_doc = bot.send_document(chat_id=channel_id, document=data["app_file"])
-            try:
-                bot.send_poll(
-                    chat_id=channel_id,
-                    question=get_text("poll_question", "en"),
-                    options=get_text("poll_options", "en"),
-                    is_anonymous=True,
-                    reply_to_message_id=sent_doc.message_id,
-                )
-            except Exception as e:
-                print(f"Error sending poll: {e}")
+
+            last_msg_id = None
+            for file_id in files_to_send:
+                sent_doc = bot.send_document(chat_id=channel_id, document=file_id)
+                last_msg_id = sent_doc.message_id
+
+            if last_msg_id:
+                try:
+                    bot.send_poll(
+                        chat_id=channel_id,
+                        question=get_text("poll_question", "en"),
+                        options=get_text("poll_options", "en"),
+                        is_anonymous=True,
+                        reply_to_message_id=last_msg_id,
+                    )
+                except Exception as e:
+                    print(f"Error sending poll: {e}")
 
         # Broadcast Notification
         submitter_name = user_data[user_id].get("submitter_name", "Unknown")
@@ -1770,30 +1856,38 @@ def auto_mirror_channel_post(message):
             )
 
         elif message.content_type == "poll":
-            # Polls: Translate question and options
-            original_poll = message.poll
-            english_question = translate_text(original_poll.question)
+            try:
+                # Polls: Translate question and options
+                original_poll = message.poll
 
-            english_options = []
-            for option in original_poll.options:
-                translated_option = translate_text(option.text)
-                english_options.append(translated_option)
+                # Helper to truncate translated text to meet API limits
+                def safe_truncate(text, limit):
+                    return smart_truncate(text, limit)
 
-            bot.send_poll(
-                chat_id=english_channel_id,
-                question=english_question,
-                options=english_options,
-                is_anonymous=original_poll.is_anonymous,
-                type=original_poll.type,
-                allows_multiple_answers=original_poll.allows_multiple_answers,
-                correct_option_id=original_poll.correct_option_id,
-                explanation=translate_text(original_poll.explanation)
-                if original_poll.explanation
-                else None,
-                open_period=original_poll.open_period,
-                close_date=original_poll.close_date,
-                is_closed=original_poll.is_closed,
-            )
+                english_question = safe_truncate(translate_text(original_poll.question), 255)
+
+                english_options = []
+                for option in original_poll.options:
+                    translated_option = safe_truncate(translate_text(option.text), 100)
+                    english_options.append(translated_option)
+
+                bot.send_poll(
+                    chat_id=english_channel_id,
+                    question=english_question,
+                    options=english_options,
+                    is_anonymous=original_poll.is_anonymous,
+                    type=original_poll.type,
+                    allows_multiple_answers=original_poll.allows_multiple_answers,
+                    correct_option_id=original_poll.correct_option_id,
+                    explanation=translate_text(original_poll.explanation)
+                    if original_poll.explanation
+                    else None,
+                    open_period=original_poll.open_period,
+                    close_date=original_poll.close_date,
+                    is_closed=original_poll.is_closed,
+                )
+            except Exception as e:
+                print(f"Error mirroring poll: {e}")
 
     except Exception as e:
         print(f"Error in auto-mirroring: {e}")
