@@ -71,7 +71,7 @@ translations = {
         "reject_button": "رفض",
         "post_approved": "تمت الموافقة على طلب النشر الخاص بك.",
         "post_rejected": "تم رفض طلب النشر الخاص بك.",
-        "poll_question": "ما هو تقييمك ؟",
+        "poll_question": "ما هو تقييمك للتطبيق؟",
         "poll_options": ["🔥 ممتاز", "⚡️ جيد", "😐 عادي", "👎 سيء"],
         "ask_rejection_reason": "الرجاء كتابة سبب الرفض.",
         "rejection_sent": "تم إرسال الرفض للمستخدم.",
@@ -709,10 +709,16 @@ def ask_confirmation(chat_id, user_id):
 
 @bot.message_handler(commands=["start"])
 def start_command(message):
-    allowed_posters_ids = os.environ.get("ALLOWED_POSTERS_IDS", "").split(",")
-    full_admin_ids = os.environ.get("FULL_ADMIN_ID", "").split(",")
+    # This version cleans up spaces and empty lines automatically
+    allowed_raw = os.environ.get("ALLOWED_POSTERS_IDS", "")
+    allowed_posters_ids = [i.strip() for i in allowed_raw.split(",") if i.strip()]
+    
+    admin_raw = os.environ.get("FULL_ADMIN_ID", "")
+    full_admin_ids = [i.strip() for i in admin_raw.split(",") if i.strip()]
 
     user_id_str = str(message.from_user.id)
+    
+    # Check if the user is in either list
     if user_id_str not in allowed_posters_ids and user_id_str not in full_admin_ids:
         bot.send_message(message.chat.id, get_text("unauthorized"))
         return
@@ -1290,7 +1296,8 @@ def confirmation_callback(call):
         )
 
         # Send to full admin for approval
-        full_admin_ids = os.environ.get("FULL_ADMIN_ID", "").split(",")
+        admin_raw = os.environ.get("FULL_ADMIN_ID", "")
+        full_admin_ids = [i.strip() for i in admin_raw.split(",") if i.strip()]
         if full_admin_ids:
             data = user_data[user_id]
             admin_message = f"{get_text('new_submission')} {call.from_user.first_name}:\n\n{call.message.caption}"
@@ -1686,7 +1693,8 @@ def admin_approval_callback(call):
 
         broadcast_msg = f"✅ تم نشر التطبيق **{app_name_notify}** بواسطة **{submitter_name}** واعتماده من قبل المشرف **{admin_name}**."
 
-        full_admin_ids = os.environ.get("FULL_ADMIN_ID", "").split(",")
+        admin_raw = os.environ.get("FULL_ADMIN_ID", "")
+        full_admin_ids = [i.strip() for i in admin_raw.split(",") if i.strip()]
         acting_admin_id = str(call.from_user.id)
 
         for admin_id in full_admin_ids:
