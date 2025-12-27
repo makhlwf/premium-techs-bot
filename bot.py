@@ -1865,31 +1865,19 @@ def auto_mirror_channel_post(message):
 
         elif message.content_type == "poll":
             try:
-                # Polls: Translate question and options
+                # Polls: Use standard English "Rate this app" template
                 original_poll = message.poll
 
-                # Helper to truncate translated text to meet API limits
-                def safe_truncate(text, limit):
-                    return smart_truncate(text, limit)
-
-                english_question = safe_truncate(translate_text(original_poll.question), 255)
-
-                english_options = []
-                for option in original_poll.options:
-                    translated_option = safe_truncate(translate_text(option.text), 100)
-                    english_options.append(translated_option)
+                english_question = get_text("poll_question", "en")
+                english_options = get_text("poll_options", "en")
 
                 bot.send_poll(
                     chat_id=english_channel_id,
                     question=english_question,
                     options=english_options,
                     is_anonymous=original_poll.is_anonymous,
-                    type=original_poll.type,
-                    allows_multiple_answers=original_poll.allows_multiple_answers,
-                    correct_option_id=original_poll.correct_option_id,
-                    explanation=translate_text(original_poll.explanation)
-                    if original_poll.explanation
-                    else None,
+                    type="regular",
+                    allows_multiple_answers=False,
                     open_period=original_poll.open_period,
                     close_date=original_poll.close_date,
                     is_closed=original_poll.is_closed,
