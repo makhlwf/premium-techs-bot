@@ -1,5 +1,4 @@
 pyTelegramBotAPI
-Flask
 python-dotenv
 deep-translator
 beautifulsoup4

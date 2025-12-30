@@ -1,5 +1,8 @@
 import os
+import sys
+import re
 import telebot
+import logging
 from telebot.handler_backends import State, StatesGroup
 from telebot import custom_filters
 from telebot.util import quick_markup
@@ -9,6 +12,9 @@ from telebot.types import (
     InlineKeyboardMarkup,
     InlineKeyboardButton,
     ReplyKeyboardRemove,
+    InputMediaPhoto,
+    InputPollOption,
+    ReplyParameters,
 )
 from dotenv import load_dotenv
 from deep_translator import GoogleTranslator
@@ -19,6 +25,7 @@ from google_play_scraper import app as play_scraper
 from urllib.parse import parse_qs, urlparse
 
 load_dotenv(override=True)
+DEBUG_MODE = os.environ.get("DEBUG_LOGS", "False").lower() == "true"
 
 # --- Translation System ---
 translations = {
@@ -80,6 +87,9 @@ translations = {
         "rejection_cancelled": "تم إلغاء الرفض.",
         "error_missing_data_msg_update": "تم إخطار المستخدم، ولكن تعذر تحديث رسالة الطلب الأصلية (البيانات مفقودة).",
         "back_button": "🔙 رجوع",
+        "btn_modded_by": "👤 تم التعديل بواسطة",
+        "ask_modded_by": "الرجاء إرسال اسم المعدل (أو اضغط رجوع للإلغاء):",
+        "footer_modded_by": "تم التعديل بواسطة :",
         "btn_auto_fill": "⚡️ تعبئة تلقائية",
         "btn_approve": "✅ اعتماد",
         "btn_reject": "❌ إلغاء",
@@ -90,6 +100,9 @@ translations = {
         "ask_autofill": "الرجاء إرسال **اسم التطبيق** للبحث عنه، أو **رابط** التطبيق على متجر جوجل بلاي.",
         "preview_caption": "🔍 نتيجة البحث:\n\n📌 الاسم: {name}\n📝 الوصف: {desc}...\n\nهل تريد اعتماد هذه البيانات؟",
         "error_not_found": "❌ لم يتم العثور على التطبيق. الرجاء المحاولة مرة أخرى أو إرسال الرابط مباشرة.",
+        "btn_add_images": "➕ صور إضافية",
+        "ask_add_images": "الرجاء إرسال الصور الإضافية. اضغط '✅ تم' عند الانتهاء.",
+        "images_added": "✅ تمت إضافة {count} صور. المجموع: {total}/10",
     },
     "en": {
         "poll_question": "Rate this app",
@@ -100,6 +113,10 @@ translations = {
         "cancel_button": "Cancel",
         "rejection_cancelled": "Rejection cancelled.",
         "error_missing_data_msg_update": "User notified, but could not update original request message (Data missing).",
+        "footer_modded_by": "Modded by :",
+        "btn_add_images": "➕ Add Images",
+        "ask_add_images": "Please send additional images. Press '✅ Done' when finished.",
+        "images_added": "✅ Added {count} images. Total: {total}/10",
     },
 }
 
@@ -108,12 +125,71 @@ def get_text(key, lang="ar"):
     return translations[lang][key]
 
 
+def clean_html_text(text):
+    if not text:
+        return ""
+    # Replace breaks with newlines
+    text = text.replace("<br>", "\n").replace("<br/>", "\n").replace("<BR>", "\n").replace("<BR/>", "\n")
+    # Strip other tags
+    return BeautifulSoup(text, "html.parser").get_text()
+
+
 def smart_truncate(text, limit=550):
     if not text:
         return ""
     if len(text) <= limit:
         return text
     return text[:limit].rstrip().rsplit(" ", 1)[0] + "..."
+
+
+def generate_safe_caption(header, description, footer_template, features, modded_by_line, max_length=1024):
+    """
+    Generates a caption that fits within the max_length limit by truncating the description
+    and potentially the features list if space is very tight.
+    """
+    # 1. Construct initial full footer
+    # Note: footer_template must have {features} placeholder
+    full_footer = footer_template.format(features=features) + modded_by_line
+
+    # 2. Calculate reserved length (header + footer + buffer for newlines)
+    # Structure: header + "\n\n" + description + "\n\n" + footer
+    # Buffer = 4 chars (\n\n * 2) + safety margin ~ 6 = 10
+    reserved = len(header) + len(full_footer) + 10
+
+    # 3. Check if we need to truncate features
+    # If reserved space > 900 (leaving < 124 for desc)
+    if reserved > 900:
+        # Truncate features to 200 chars
+        features = smart_truncate(features, limit=200)
+        # Reconstruct footer
+        full_footer = footer_template.format(features=features) + modded_by_line
+        # Recalculate reserved
+        reserved = len(header) + len(full_footer) + 10
+
+    # 4. Calculate available space for description
+    available_desc = max_length - reserved
+
+    # Ensure we don't pass a negative limit
+    if available_desc < 0:
+        available_desc = 0
+
+    # 5. Truncate description
+    final_desc = smart_truncate(description, limit=available_desc)
+
+    # 6. Assemble final caption
+    return f"{header}\n\n{final_desc}\n\n{full_footer}"
+
+
+def get_clean_filename(app_name):
+    if not app_name:
+        return "File"
+    extensions_to_strip = [".apk", ".xapk", ".apkm", ".zip", ".rar", ".7z"]
+    clean_name = app_name
+    for ext in extensions_to_strip:
+        if clean_name.lower().endswith(ext):
+            clean_name = clean_name[:-len(ext)]
+            break
+    return clean_name
 
 
 def get_back_markup():
@@ -153,6 +229,7 @@ def get_features_markup(selected_set):
         buttons.append(InlineKeyboardButton(text, callback_data=f"feat_{tag}"))
 
     markup.add(*buttons)
+    markup.row(InlineKeyboardButton(get_text("btn_modded_by"), callback_data="feat_modded_by"))
     markup.add(InlineKeyboardButton("✅ تم (Done)", callback_data="feat_done"))
     markup.add(InlineKeyboardButton("🔙 رجوع", callback_data="go_back"))
     return markup
@@ -222,6 +299,9 @@ class BotStates(StatesGroup):
     af_edit_image = State()
     admin_approval = State()
     admin_rejection_reason = State()
+    edit_menu = State()
+    modded_by_name = State()
+    adding_more_images = State()
 
 
 # Initialize the bot with threaded=False for Vercel/webhooks
@@ -229,6 +309,8 @@ bot = telebot.TeleBot(
     os.environ.get("BOT_TOKEN"), threaded=False, use_class_middlewares=True
 )
 bot.add_custom_filter(custom_filters.StateFilter(bot))
+
+print("--- BOT LOADED ---")
 
 # --- Ask Functions ---
 
@@ -371,6 +453,9 @@ def send_autofill_preview(chat_id, user_id, message_id_to_delete=None):
         InlineKeyboardButton(get_text("btn_approve"), callback_data="af_approve"),
         InlineKeyboardButton(get_text("btn_reject"), callback_data="af_reject"),
     )
+    markup.row(
+        InlineKeyboardButton(get_text("btn_add_images"), callback_data="trigger_add_images")
+    )
 
     try:
         # Check if icon is a URL or file_id
@@ -380,7 +465,75 @@ def send_autofill_preview(chat_id, user_id, message_id_to_delete=None):
             bot.send_photo(chat_id, temp["icon"], caption=caption, reply_markup=markup)
     except Exception as e:
         print(f"Error sending preview: {e}")
-        bot.send_message(chat_id, get_text("error_not_found"))
+        bot.send_message(chat_id, text=caption + "\n\n⚠️ [Image Error]: Could not load preview.", reply_markup=markup)
+
+
+@bot.message_handler(commands=['cancel'])
+def cancel_command(message):
+    if DEBUG_MODE:
+        print(f"DEBUG: Entering cancel_command for {message.from_user.id}", file=sys.stderr)
+    try:
+        # Try to go back one step safely
+        go_back(message.chat.id, message.from_user.id)
+    except Exception:
+        # If ANY error occurs (stuck state, missing data), FORCE RESET
+        start_command(message)
+
+
+@bot.message_handler(commands=["start"])
+def start_command(message):
+    if DEBUG_MODE:
+        print(f"DEBUG: Entering start_command for {message.from_user.id}", file=sys.stderr)
+    chat_id = message.chat.id
+    user_id = message.from_user.id
+
+    # GOD MODE CLEANUP: Execute each, ignore errors individually
+    try:
+        bot.clear_step_handler_by_chat_id(chat_id)
+    except Exception:
+        pass
+
+    try:
+        bot.delete_state(user_id, chat_id)
+    except Exception:
+        pass
+
+    try:
+        user_data.pop(user_id, None)
+    except Exception:
+        pass
+
+    try:
+        # 2. Authorization Check (Keep existing logic)
+        # This version cleans up spaces and empty lines automatically
+        allowed_raw = os.environ.get("ALLOWED_POSTERS_IDS", "")
+        allowed_posters_ids = [i.strip() for i in allowed_raw.split(",") if i.strip()]
+
+        admin_raw = os.environ.get("FULL_ADMIN_ID", "")
+        full_admin_ids = [i.strip() for i in admin_raw.split(",") if i.strip()]
+
+        user_id_str = str(message.from_user.id)
+
+        # Check if the user is in either list
+        if user_id_str not in allowed_posters_ids and user_id_str not in full_admin_ids:
+            bot.send_message(message.chat.id, get_text("unauthorized"))
+            return
+
+        # 3. Guaranteed Response
+        markup = quick_markup(
+            {get_text("start_button"): {"callback_data": "start_conversation"}}
+        )
+        bot.send_message(
+            message.chat.id,
+            get_text("welcome"),
+            reply_markup=markup,
+            parse_mode="Markdown",
+        )
+
+    except Exception as e:
+        # 4. The "Last Resort" Response
+        print(f"Critical /start error: {e}")
+        bot.send_message(message.chat.id, "⚠️ System Reset. Please try again.")
 
 
 @bot.callback_query_handler(
@@ -481,6 +634,8 @@ def autofill_deep_fetch_callback(call):
 
 @bot.message_handler(state=BotStates.af_edit_name)
 def af_edit_name_handler(message):
+    if message.text and message.text.startswith('/'):
+        return
     user_id = message.from_user.id
     new_name = message.text
     if user_data[user_id].get("temp_autofill"):
@@ -491,6 +646,8 @@ def af_edit_name_handler(message):
 
 @bot.message_handler(state=BotStates.af_edit_desc)
 def af_edit_desc_handler(message):
+    if message.text and message.text.startswith('/'):
+        return
     user_id = message.from_user.id
     new_desc = message.text
     if user_data[user_id].get("temp_autofill"):
@@ -518,7 +675,7 @@ def ask_app_version(chat_id, user_id):
 
 
 def ask_app_description(chat_id, user_id):
-    if user_data.get(user_id, {}).get("auto_filled"):
+    if user_data.get(user_id, {}).get("auto_filled") and not user_data.get(user_id, {}).get("edit_mode"):
         ask_mod_features(chat_id, user_id)
         return
 
@@ -587,16 +744,35 @@ def ask_english_mod_features(chat_id, user_id):
 
 
 def ask_app_image(chat_id, user_id):
-    is_autofilled = user_data.get(user_id, {}).get("auto_filled", False)
-    has_image = "app_image" in user_data.get(user_id, {})
+    data = user_data.get(user_id, {})
+    is_autofilled = data.get("auto_filled", False)
+    is_edit_mode = data.get("edit_mode", False)
 
-    if is_autofilled and has_image:
+    # Ensure app_images list exists or migrate legacy single image
+    if "app_images" not in data:
+        if "app_image" in data:
+            data["app_images"] = [data["app_image"]]
+        else:
+            data["app_images"] = []
+
+    has_images = len(data["app_images"]) > 0
+
+    if is_autofilled and has_images and not is_edit_mode:
         ask_app_file(chat_id, user_id)
         return
 
+    # Clear images if entering this step (Manual or Edit Mode reset)
+    user_data[user_id]["app_images"] = []
+
     bot.set_state(user_id, BotStates.app_image, chat_id)
+
+    markup = ReplyKeyboardMarkup(resize_keyboard=True, one_time_keyboard=True)
+    markup.add(KeyboardButton("✅ تم"), KeyboardButton(get_text("back_button")))
+
     bot.send_message(
-        chat_id, get_text("app_image_question_with_url"), reply_markup=get_back_markup()
+        chat_id,
+        "الرجاء إرسال صور التطبيق (يمكنك إرسال أكثر من صورة). اضغط '✅ تم' عند الانتهاء.",
+        reply_markup=markup,
     )
 
 
@@ -657,6 +833,12 @@ def ask_app_file(chat_id, user_id):
 def ask_confirmation(chat_id, user_id):
     bot.set_state(user_id, BotStates.confirmation, chat_id)
     data = user_data[user_id]
+
+    # Ensure app_images
+    images = data.get("app_images", [])
+    if not images and "app_image" in data:
+        images = [data["app_image"]]
+
     # Truncate descriptions for preview to prevent caption overflow
     preview_desc_ar = smart_truncate(data.get("app_description", ""), limit=300)
 
@@ -679,21 +861,45 @@ def ask_confirmation(chat_id, user_id):
         confirmation_message += (
             f"ميزات التعديل باللغة الإنجليزية: {data.get('english_mod_features')}\n"
         )
+    if "modded_by" in data:
+        confirmation_message += f"\n{get_text('footer_modded_by')} {data['modded_by']}"
 
-    markup = quick_markup(
-        {
-            get_text("confirm_button"): {"callback_data": "confirm"},
-            get_text("restart_button"): {"callback_data": "restart"},
-            get_text("back_button"): {"callback_data": "go_back"},
-        },
-        row_width=2,
+    markup = InlineKeyboardMarkup()
+    # Row 1: Confirm, Restart
+    markup.row(
+        InlineKeyboardButton(get_text("confirm_button"), callback_data="confirm"),
+        InlineKeyboardButton(get_text("restart_button"), callback_data="restart"),
     )
-    bot.send_photo(
-        chat_id=chat_id,
-        photo=data["app_image"],
-        caption=confirmation_message,
-        reply_markup=markup,
-    )
+    # Row 2: Edit
+    markup.row(InlineKeyboardButton("✏️ تعديل", callback_data="trigger_edit_menu"))
+    # Row 3: Back
+    markup.row(InlineKeyboardButton(get_text("back_button"), callback_data="go_back"))
+
+    if len(images) > 1:
+        # Album Flow
+        media = []
+        # First image has simple caption
+        media.append(InputMediaPhoto(images[0], caption="🖼️ صور التطبيق"))
+        for img in images[1:]:
+            media.append(InputMediaPhoto(img))
+
+        bot.send_media_group(chat_id=chat_id, media=media)
+
+        # Send text separately with buttons
+        bot.send_message(
+            chat_id=chat_id,
+            text=confirmation_message,
+            reply_markup=markup,
+        )
+    else:
+        # Single Image Flow
+        img = images[0] if images else data.get("app_image")
+        bot.send_photo(
+            chat_id=chat_id,
+            photo=img,
+            caption=confirmation_message,
+            reply_markup=markup,
+        )
 
     # Send files to user for verification
     files = data.get("app_files", [])
@@ -701,34 +907,14 @@ def ask_confirmation(chat_id, user_id):
         files = [data["app_file"]]
 
     for file_id in files:
-        bot.send_document(chat_id=chat_id, document=file_id)
+        # Generate caption with clean app name
+        app_name = data.get("app_name", "File")
+        clean_name = get_clean_filename(app_name)
+        file_caption = f"{clean_name}\n@premium_techs\n@premium_techs_EN"
+        bot.send_document(chat_id=chat_id, document=file_id, caption=file_caption)
 
 
 # --- Handlers ---
-
-
-@bot.message_handler(commands=["start"])
-def start_command(message):
-    # This version cleans up spaces and empty lines automatically
-    allowed_raw = os.environ.get("ALLOWED_POSTERS_IDS", "")
-    allowed_posters_ids = [i.strip() for i in allowed_raw.split(",") if i.strip()]
-    
-    admin_raw = os.environ.get("FULL_ADMIN_ID", "")
-    full_admin_ids = [i.strip() for i in admin_raw.split(",") if i.strip()]
-
-    user_id_str = str(message.from_user.id)
-    
-    # Check if the user is in either list
-    if user_id_str not in allowed_posters_ids and user_id_str not in full_admin_ids:
-        bot.send_message(message.chat.id, get_text("unauthorized"))
-        return
-
-    markup = quick_markup(
-        {get_text("start_button"): {"callback_data": "start_conversation"}}
-    )
-    bot.send_message(
-        message.chat.id, get_text("welcome"), reply_markup=markup, parse_mode="Markdown"
-    )
 
 
 @bot.callback_query_handler(func=lambda call: call.data == "start_conversation")
@@ -785,6 +971,8 @@ def trigger_auto_fill_callback(call):
 
 @bot.message_handler(state=BotStates.waiting_for_autofill)
 def autofill_input_handler(message):
+    if message.text and message.text.startswith('/'):
+        return
     user_id = message.from_user.id
     if message.text == get_text("back_button"):
         go_back(message.chat.id, user_id)
@@ -844,9 +1032,9 @@ def autofill_input_handler(message):
         result = play_scraper(app_id, lang="en", country="us")
 
         app_name = result.get("title", text)
-        desc_en = result.get("description", "")
-        summary_en = result.get("summary", "")
-        changes_en = result.get("recentChanges", "") or ""  # Might be None
+        desc_en = clean_html_text(result.get("description", ""))
+        summary_en = clean_html_text(result.get("summary", ""))
+        changes_en = clean_html_text(result.get("recentChanges", "") or "")
 
         # Prepare Text
         truncated_en_preview = (
@@ -959,7 +1147,7 @@ def autofill_callback_handler(call):
                     sent_msg = bot.send_photo(
                         call.message.chat.id, photo_file, caption=f"✅ {temp['name']}"
                     )
-                    user_data[user_id]["app_image"] = sent_msg.photo[-1].file_id
+                    user_data[user_id]["app_images"] = [sent_msg.photo[-1].file_id]
                 else:
                     bot.send_message(
                         call.message.chat.id,
@@ -969,7 +1157,7 @@ def autofill_callback_handler(call):
                 print(f"Image download error: {e}")
         else:
             # Already a file_id from user upload
-            user_data[user_id]["app_image"] = temp["icon"]
+            user_data[user_id]["app_images"] = [temp["icon"]]
             bot.delete_message(call.message.chat.id, call.message.message_id)
             bot.send_photo(
                 call.message.chat.id, temp["icon"], caption=f"✅ {temp['name']}"
@@ -999,34 +1187,56 @@ def autofill_callback_handler(call):
 
 @bot.message_handler(state=BotStates.app_name)
 def app_name_handler(message):
+    if message.text and message.text.startswith('/'):
+        return
     user_id = message.from_user.id
     if message.text == get_text("back_button"):
         go_back(message.chat.id, user_id)
         return
     user_data[user_id]["app_name"] = message.text
+
+    if user_data[user_id].get("edit_mode"):
+        show_edit_menu(message.chat.id, user_id)
+        return
+
     ask_app_version(message.chat.id, user_id)
 
 
 @bot.message_handler(state=BotStates.app_version)
 def app_version_handler(message):
+    if message.text and message.text.startswith('/'):
+        return
     user_id = message.from_user.id
     if message.text == get_text("back_button"):
         go_back(message.chat.id, user_id)
         return
     user_data[user_id]["app_version"] = message.text
+
+    if user_data[user_id].get("edit_mode"):
+        show_edit_menu(message.chat.id, user_id)
+        return
+
     ask_app_description(message.chat.id, user_id)
 
 
 @bot.message_handler(state=BotStates.app_description)
 def app_description_handler(message):
+    if message.text and message.text.startswith('/'):
+        return
     user_id = message.from_user.id
     if message.text == get_text("back_button"):
         go_back(message.chat.id, user_id)
         return
     user_data[user_id]["app_description"] = message.text
     if user_data[user_id].get("publish_target") in ["english", "both"]:
+        # Internal step, do not check edit_mode yet
         ask_translate_description(message.chat.id, user_id)
     else:
+        # End of Description unit
+        if user_data[user_id].get("edit_mode"):
+            show_edit_menu(message.chat.id, user_id)
+            return
+
         user_data[user_id]["selected_features"] = set()  # Reset features
         ask_mod_features(message.chat.id, user_id)
 
@@ -1054,6 +1264,10 @@ def translate_description_callback(call):
             )
             user_data[user_id]["english_description"] = translated
 
+            if user_data[user_id].get("edit_mode"):
+                show_edit_menu(call.message.chat.id, user_id)
+                return
+
             user_data[user_id]["selected_features"] = set()  # Reset features
             ask_mod_features(call.message.chat.id, user_id)
         except Exception as e:
@@ -1068,11 +1282,18 @@ def translate_description_callback(call):
 
 @bot.message_handler(state=BotStates.manual_translation)
 def manual_translation_handler(message):
+    if message.text and message.text.startswith('/'):
+        return
     user_id = message.from_user.id
     if message.text == get_text("back_button"):
         go_back(message.chat.id, user_id)
         return
     user_data[user_id]["english_description"] = message.text
+
+    if user_data[user_id].get("edit_mode"):
+        show_edit_menu(message.chat.id, user_id)
+        return
+
     user_data[user_id]["selected_features"] = set()  # Reset features
     ask_mod_features(message.chat.id, user_id)
 
@@ -1093,6 +1314,7 @@ def features_callback_handler(call):
 
         if publish_target in ["english", "both"]:
             if translation_mode == "manual":
+                # Internal step
                 ask_english_mod_features(call.message.chat.id, user_id)
             else:
                 # Auto translate
@@ -1101,6 +1323,11 @@ def features_callback_handler(call):
                         features_str
                     )
                     user_data[user_id]["english_mod_features"] = translated
+
+                    if user_data[user_id].get("edit_mode"):
+                        show_edit_menu(call.message.chat.id, user_id)
+                        return
+
                     ask_hashtag(call.message.chat.id, user_id)
                 except Exception as e:
                     print(f"Translation error: {e}")
@@ -1111,7 +1338,20 @@ def features_callback_handler(call):
                         user_id, BotStates.english_mod_features, call.message.chat.id
                     )
         else:
+            if user_data[user_id].get("edit_mode"):
+                show_edit_menu(call.message.chat.id, user_id)
+                return
+
             ask_hashtag(call.message.chat.id, user_id)
+
+    elif action == "feat_modded_by":
+        bot.answer_callback_query(call.id)
+        bot.set_state(user_id, BotStates.modded_by_name, call.message.chat.id)
+        # Send the prompt with a Back button
+        markup = ReplyKeyboardMarkup(resize_keyboard=True, one_time_keyboard=True)
+        markup.add(KeyboardButton(get_text("back_button")))
+        bot.send_message(call.message.chat.id, get_text("ask_modded_by"), reply_markup=markup)
+
     else:
         tag = action.replace("feat_", "")
         if "selected_features" not in user_data[user_id]:
@@ -1134,8 +1374,24 @@ def features_callback_handler(call):
         bot.answer_callback_query(call.id)
 
 
+@bot.message_handler(state=BotStates.modded_by_name)
+def modded_by_name_handler(message):
+    if message.text and message.text.startswith('/'):
+        return
+    user_id = message.from_user.id
+    if message.text == get_text("back_button"):
+        ask_mod_features(message.chat.id, user_id)
+        return
+
+    user_data[user_id]["modded_by"] = message.text
+    bot.send_message(message.chat.id, "✅ تم حفظ الاسم.")
+    ask_mod_features(message.chat.id, user_id)
+
+
 @bot.message_handler(state=BotStates.mod_features)
 def mod_features_handler(message):
+    if message.text and message.text.startswith('/'):
+        return
     user_id = message.from_user.id
     if message.text == get_text("back_button"):
         go_back(message.chat.id, user_id)
@@ -1154,26 +1410,49 @@ def mod_features_handler(message):
 
 @bot.message_handler(state=BotStates.english_mod_features)
 def english_mod_features_handler(message):
+    if message.text and message.text.startswith('/'):
+        return
     user_id = message.from_user.id
     if message.text == get_text("back_button"):
         go_back(message.chat.id, user_id)
         return
     user_data[user_id]["english_mod_features"] = message.text
+
+    if user_data[user_id].get("edit_mode"):
+        show_edit_menu(message.chat.id, user_id)
+        return
+
     ask_hashtag(message.chat.id, user_id)
 
 
 @bot.message_handler(state=BotStates.app_image, content_types=["photo", "text"])
 def app_image_handler(message):
     user_id = message.from_user.id
-    if message.content_type == "text" and message.text == get_text("back_button"):
-        go_back(message.chat.id, user_id)
-        return
+    data = user_data[user_id]
 
-    if message.content_type == "photo":
-        user_data[user_id]["app_image"] = message.photo[-1].file_id
-        ask_app_file(message.chat.id, user_id)
+    if "app_images" not in data:
+        data["app_images"] = []
 
-    elif message.content_type == "text":
+    if message.content_type == "text":
+        if message.text and message.text.startswith('/'):
+            return
+
+        if message.text == "✅ تم":
+            if not data["app_images"]:
+                bot.send_message(message.chat.id, "⚠️ الرجاء إرسال صورة واحدة على الأقل.")
+                return
+
+            if data.get("edit_mode"):
+                show_edit_menu(message.chat.id, user_id)
+                return
+
+            ask_app_file(message.chat.id, user_id)
+            return
+
+        if message.text == get_text("back_button"):
+            go_back(message.chat.id, user_id)
+            return
+
         url = message.text
         if "play.google.com" in url:
             icon_url = fetch_icon_from_play_store(url)
@@ -1186,8 +1465,17 @@ def app_image_handler(message):
                         photo_file = io.BytesIO(img_response.content)
                         photo_file.name = "icon.jpg"
                         sent_msg = bot.send_photo(message.chat.id, photo_file)
-                        user_data[user_id]["app_image"] = sent_msg.photo[-1].file_id
-                        ask_app_file(message.chat.id, user_id)
+
+                        if len(data["app_images"]) < 10:
+                            data["app_images"].append(sent_msg.photo[-1].file_id)
+                            count = len(data["app_images"])
+                            bot.send_message(
+                                message.chat.id,
+                                f"✅ تم استلام الصورة {count}. أرسل المزيد أو اضغط '✅ تم'."
+                            )
+                        else:
+                            bot.send_message(message.chat.id, "⚠️ الحد الأقصى 10 صور. اضغط '✅ تم'.")
+
                     else:
                         bot.send_message(message.chat.id, get_text("fetch_error"))
                 except Exception as e:
@@ -1197,6 +1485,18 @@ def app_image_handler(message):
                 bot.send_message(message.chat.id, get_text("fetch_error"))
         else:
             bot.send_message(message.chat.id, get_text("fetch_error"))
+
+    elif message.content_type == "photo":
+        if len(data["app_images"]) >= 10:
+            bot.send_message(message.chat.id, "⚠️ لقد وصلت إلى الحد الأقصى للملفات (10). اضغط '✅ تم'.")
+            return
+
+        data["app_images"].append(message.photo[-1].file_id)
+        count = len(data["app_images"])
+        bot.send_message(
+            message.chat.id,
+            f"✅ تم استلام الصورة {count}. أرسل المزيد أو اضغط '✅ تم'."
+        )
 
 
 @bot.callback_query_handler(state=BotStates.hashtag)
@@ -1208,11 +1508,18 @@ def hashtag_callback(call):
 
     user_data[user_id]["hashtag"] = call.data
     bot.answer_callback_query(call.id, f"لقد اخترت: {call.data}")
+
+    if user_data[user_id].get("edit_mode"):
+        show_edit_menu(call.message.chat.id, user_id)
+        return
+
     ask_app_image(call.message.chat.id, user_id)
 
 
 @bot.message_handler(state=BotStates.hashtag)
 def hashtag_text_handler(message):
+    if message.text and message.text.startswith('/'):
+        return
     user_id = message.from_user.id
     if message.text == get_text("back_button"):
         go_back(message.chat.id, user_id)
@@ -1226,6 +1533,11 @@ def hashtag_text_handler(message):
     final_tag = f"#{cleaned_text}"
     user_data[user_id]["hashtag"] = final_tag
     bot.send_message(message.chat.id, f"✅ هاشتاج: {final_tag}")
+
+    if user_data[user_id].get("edit_mode"):
+        show_edit_menu(message.chat.id, user_id)
+        return
+
     ask_app_image(message.chat.id, user_id)
 
 
@@ -1242,6 +1554,11 @@ def files_done_callback(call):
         return
 
     bot.answer_callback_query(call.id)
+
+    if user_data[user_id].get("edit_mode"):
+        show_edit_menu(call.message.chat.id, user_id)
+        return
+
     ask_confirmation(call.message.chat.id, user_id)
 
 
@@ -1269,6 +1586,8 @@ def app_file_handler(message):
                 reply_markup=get_done_markup(),
             )
     else:
+        if message.text and message.text.startswith('/'):
+            return
         # If user sends something else (like text)
         bot.send_message(
             message.chat.id,
@@ -1277,7 +1596,10 @@ def app_file_handler(message):
         )
 
 
-@bot.callback_query_handler(state=BotStates.confirmation)
+@bot.callback_query_handler(
+    func=lambda call: call.data in ["confirm", "restart", "go_back"],
+    state=BotStates.confirmation,
+)
 def confirmation_callback(call):
     user_id = call.from_user.id
     if call.data == "go_back":
@@ -1289,18 +1611,30 @@ def confirmation_callback(call):
         user_data[user_id]["submitter_name"] = call.from_user.first_name
 
         bot.answer_callback_query(call.id, get_text("request_submitted"))
-        bot.edit_message_caption(
-            chat_id=call.message.chat.id,
-            message_id=call.message.message_id,
-            caption=get_text("request_pending"),
-        )
+
+        status_text = get_text("request_pending")
+        if call.message.caption:
+            # Single Image Flow (Photo)
+            bot.edit_message_caption(
+                chat_id=call.message.chat.id,
+                message_id=call.message.message_id,
+                caption=status_text,
+            )
+        else:
+            # Album Flow (Text Message) - REPLACE text to avoid crash
+            bot.edit_message_text(
+                chat_id=call.message.chat.id,
+                message_id=call.message.message_id,
+                text=status_text,
+            )
 
         # Send to full admin for approval
         admin_raw = os.environ.get("FULL_ADMIN_ID", "")
         full_admin_ids = [i.strip() for i in admin_raw.split(",") if i.strip()]
         if full_admin_ids:
             data = user_data[user_id]
-            admin_message = f"{get_text('new_submission')} {call.from_user.first_name}:\n\n{call.message.caption}"
+            user_text = call.message.caption if call.message.caption else call.message.text
+            admin_message = f"{get_text('new_submission')} {call.from_user.first_name}:\n\n{user_text}"
             markup = quick_markup(
                 {
                     get_text("approve_button"): {
@@ -1322,12 +1656,34 @@ def confirmation_callback(call):
                 if not admin_id.strip():
                     continue
                 try:
-                    bot.send_photo(
-                        chat_id=admin_id,
-                        photo=data["app_image"],
-                        caption=admin_message,
-                        reply_markup=markup,
-                    )
+                    # Ensure app_images
+                    images = data.get("app_images", [])
+                    if not images and "app_image" in data:
+                        images = [data["app_image"]]
+
+                    if len(images) > 1:
+                        # Album Flow
+                        media = []
+                        media.append(InputMediaPhoto(images[0], caption="🖼️ طلب جديد"))
+                        for img in images[1:]:
+                            media.append(InputMediaPhoto(img))
+
+                        bot.send_media_group(chat_id=admin_id, media=media)
+                        bot.send_message(
+                            chat_id=admin_id,
+                            text=admin_message,
+                            reply_markup=markup,
+                        )
+                    else:
+                        # Single Image Flow
+                        img = images[0] if images else data.get("app_image")
+                        bot.send_photo(
+                            chat_id=admin_id,
+                            photo=img,
+                            caption=admin_message,
+                            reply_markup=markup,
+                        )
+
                     for file_id in files_to_send:
                         bot.send_document(chat_id=admin_id, document=file_id)
                 except Exception as e:
@@ -1352,6 +1708,11 @@ def go_back_callback(call):
 
 
 def go_back(chat_id, user_id):
+    # Check for Edit Mode Interception
+    if user_data.get(user_id, {}).get("edit_mode"):
+        show_edit_menu(chat_id, user_id)
+        return
+
     state = bot.get_state(user_id, chat_id)
     data = user_data.get(user_id, {})
 
@@ -1361,60 +1722,49 @@ def go_back(chat_id, user_id):
     if state == BotStates.app_type.name:
         # From App Type back to Post Type
         ask_post_type(chat_id, user_id)
-        if "app_type" in data:
-            del data["app_type"]
+        data.pop("app_type", None)
 
     elif state == BotStates.source.name:
         # From Source back to App Type
         ask_app_type(chat_id, user_id)
-        if "source" in data:
-            del data["source"]
+        data.pop("source", None)
 
     elif state == BotStates.publish_target.name:
         # From Publish Target back to Source
         ask_source(chat_id, user_id)
-        if "publish_target" in data:
-            del data["publish_target"]
+        data.pop("publish_target", None)
 
     elif state == BotStates.app_name.name:
         # From App Name back to Publish Target
         ask_publish_target(chat_id, user_id)
-        if "app_name" in data:
-            del data["app_name"]
+        data.pop("app_name", None)
 
     elif state == BotStates.app_version.name:
         # From Version back to Name
         ask_app_name(chat_id, user_id)
-        if "app_version" in data:
-            del data["app_version"]
+        data.pop("app_version", None)
 
     elif state == BotStates.app_description.name:
         # From Desc back to Version
         ask_app_version(chat_id, user_id)
-        if "app_description" in data:
-            del data["app_description"]
+        data.pop("app_description", None)
 
     elif state == BotStates.translate_description.name:
         # From Translate Menu back to Desc
         ask_app_description(chat_id, user_id)
-        if "translate_description" in data:
-            del data["translate_description"]
-        if "translation_mode" in data:
-            del data["translation_mode"]
+        data.pop("translate_description", None)
+        data.pop("translation_mode", None)
 
     elif state == BotStates.manual_translation.name:
         # From Manual Trans back to Translate Menu
         ask_translate_description(chat_id, user_id)
-        if "english_description" in data:
-            del data["english_description"]
+        data.pop("english_description", None)
 
     elif state == BotStates.mod_features.name:
         # From Mod Features back to...
         # We are leaving Mod Features, so clear it.
-        if "mod_features" in data:
-            del data["mod_features"]
-        if "selected_features" in data:
-            del data["selected_features"]
+        data.pop("mod_features", None)
+        data.pop("selected_features", None)
 
         publish_target = data.get("publish_target")
         translation_mode = data.get("translation_mode")
@@ -1430,13 +1780,18 @@ def go_back(chat_id, user_id):
     elif state == BotStates.english_mod_features.name:
         # From Eng Mod Features back to Mod Features
         ask_mod_features(chat_id, user_id)
-        if "english_mod_features" in data:
-            del data["english_mod_features"]
+        data.pop("english_mod_features", None)
+
+    elif state == BotStates.modded_by_name.name:
+        # From Modded By input back to Mod Features
+        ask_mod_features(chat_id, user_id)
+        # We assume back means discard current action, so no data pop needed if not saved yet,
+        # or we keep existing data if user just wanted to check.
+        # Handler saves data immediately. Back just navigates.
 
     elif state == BotStates.app_image.name:
         # From App Image back to... DYNAMIC
-        if "app_image" in data:
-            del data["app_image"]
+        data.pop("app_image", None)
 
         if data.get("post_type") == "game":
             # Games skip hashtag, so go back to Mod Features
@@ -1448,15 +1803,14 @@ def go_back(chat_id, user_id):
                 ask_english_mod_features(chat_id, user_id)
             else:
                 ask_mod_features(chat_id, user_id)
-                if translation_mode == "auto" and "english_mod_features" in data:
-                    del data["english_mod_features"]
+                if translation_mode == "auto":
+                    data.pop("english_mod_features", None)
         else:
             ask_hashtag(chat_id, user_id)
 
     elif state == BotStates.hashtag.name:
         # From Hashtag back to Mod Features
-        if "hashtag" in data:
-            del data["hashtag"]
+        data.pop("hashtag", None)
 
         publish_target = data.get("publish_target")
         translation_mode = data.get("translation_mode")
@@ -1468,15 +1822,13 @@ def go_back(chat_id, user_id):
             # Came from Mod Features (Arabic or Auto-Translated)
             ask_mod_features(chat_id, user_id)
 
-            if translation_mode == "auto" and "english_mod_features" in data:
-                del data["english_mod_features"]
+            if translation_mode == "auto":
+                data.pop("english_mod_features", None)
 
     elif state == BotStates.app_file.name:
         # From File back to...
-        if "app_file" in data:
-            del data["app_file"]
-        if "app_files" in data:
-            del data["app_files"]
+        data.pop("app_file", None)
+        data.pop("app_files", None)
 
         # Check if Auto-Filled Image exists (Skip Image step) or Manual (Go to Image)
         if data.get("auto_filled") and "app_image" in data:
@@ -1515,12 +1867,27 @@ def admin_approval_callback(call):
     original_poster_id = user_data[user_id].get("original_poster_id")
 
     if action == "approve":
-        bot.answer_callback_query(call.id, "✅ تمت الموافقة")
-        bot.edit_message_caption(
+        # Double Click Prevention: Remove buttons immediately
+        bot.edit_message_reply_markup(
             chat_id=call.message.chat.id,
             message_id=call.message.message_id,
-            caption="✅ تمت الموافقة",
+            reply_markup=None,
         )
+
+        bot.answer_callback_query(call.id, "✅ تمت الموافقة")
+        status_text = "✅ تمت الموافقة"
+        if call.message.caption:
+            bot.edit_message_caption(
+                chat_id=call.message.chat.id,
+                message_id=call.message.message_id,
+                caption=status_text,
+            )
+        else:
+            bot.edit_message_text(
+                chat_id=call.message.chat.id,
+                message_id=call.message.message_id,
+                text=status_text,
+            )
 
         # Publish the post
         data = user_data[user_id]
@@ -1543,42 +1910,28 @@ def admin_approval_callback(call):
                 "معدلة وفيها" if data.get("app_type") == "mod" else "النسخة رسمية"
             )
 
-            part_top = f"🧩 {type_str}: {data.get('app_name')}\n📍من {source_str}"
+            header = f"🧩 {type_str}: {data.get('app_name')}\n📍من {source_str}"
+
+            # Footer template with {features} placeholder preserved
+            footer_template = f"🧊 الإصدار:  {data.get('app_version')}\n🏷 {mod_label}:\n{{features}}\n              ༺━━ @premium_techs ━━༻\nللتنزيل من هنا ⬇️ {data.get('hashtag')}"
 
             features_text = data.get("mod_features", "")
-            part_bottom_template = "🧊 الإصدار:  {version}\n🏷 {mod_label}:\n{features}\n              ༺━━ @premium_techs ━━༻\nللتنزيل من هنا ⬇️ {hashtag}"
-            part_bottom = part_bottom_template.format(
-                version=data.get("app_version"),
-                mod_label=mod_label,
+            modder_name = data.get("modded_by")
+            modded_by_line = (
+                f"\n\n{get_text('footer_modded_by', 'ar')} {modder_name}"
+                if modder_name
+                else ""
+            )
+
+            description = f"⚡ الوصف : {data.get('app_description', '')}"
+
+            post_template_ar = generate_safe_caption(
+                header=header,
+                description=description,
+                footer_template=footer_template,
                 features=features_text,
-                hashtag=data.get("hashtag"),
+                modded_by_line=modded_by_line,
             )
-
-            # 2. Check Overhead
-            # Buffer = 20 (newlines and '⚡ الوصف : ')
-            overhead = len(part_top) + len(part_bottom) + 20
-
-            if overhead > 950:
-                # Truncate features
-                features_text = features_text[:400] + "..."
-                part_bottom = part_bottom_template.format(
-                    version=data.get("app_version"),
-                    mod_label=mod_label,
-                    features=features_text,
-                    hashtag=data.get("hashtag"),
-                )
-                overhead = len(part_top) + len(part_bottom) + 20
-
-            # 3. Calculate Available Space
-            available_for_desc = max(50, 1024 - overhead)
-
-            # 4. Truncate Description
-            ar_desc = smart_truncate(
-                data.get("app_description", ""), limit=available_for_desc
-            )
-
-            # 5. Assemble
-            post_template_ar = f"{part_top}\n⚡ الوصف : {ar_desc}\n{part_bottom}"
 
         if publish_target == "english" or publish_target == "both":
             # 1. Build Parts
@@ -1592,96 +1945,121 @@ def admin_approval_callback(call):
                 "Modded with" if data.get("app_type") == "mod" else "Official Version"
             )
 
-            part_top = f"🧩 {type_str}: {data.get('app_name')}\n📍From: {source_str}"
+            header = f"🧩 {type_str}: {data.get('app_name')}\n📍From: {source_str}"
+
+            # Footer template with {features} placeholder preserved
+            footer_template = f"🧊 Version: {data.get('app_version')}\n🏷 {mod_label}:\n{{features}}\n              ༺━━ @premium_techs ━━༻\nDownload from here ⬇️ {data.get('hashtag')}"
 
             features_text = (
                 data.get("english_mod_features")
                 if "english_mod_features" in data
                 else data.get("mod_features", "")
             )
-            part_bottom_template = "🧊 Version: {version}\n🏷 {mod_label}:\n{features}\n              ༺━━ @premium_techs ━━༻\nDownload from here ⬇️ {hashtag}"
-            part_bottom = part_bottom_template.format(
-                version=data.get("app_version"),
-                mod_label=mod_label,
-                features=features_text,
-                hashtag=data.get("hashtag"),
+
+            modder_name = data.get("modded_by")
+            modded_by_line = (
+                f"\n\n{get_text('footer_modded_by', 'en')} {modder_name}"
+                if modder_name
+                else ""
             )
 
-            # 2. Check Overhead
-            overhead = len(part_top) + len(part_bottom) + 20
-
-            if overhead > 950:
-                # Truncate features
-                features_text = features_text[:400] + "..."
-                part_bottom = part_bottom_template.format(
-                    version=data.get("app_version"),
-                    mod_label=mod_label,
-                    features=features_text,
-                    hashtag=data.get("hashtag"),
-                )
-                overhead = len(part_top) + len(part_bottom) + 20
-
-            # 3. Calculate Available Space
-            available_for_desc = max(50, 1024 - overhead)
-
-            # 4. Truncate Description
             en_desc_raw = (
                 data.get("english_description")
                 if "english_description" in data
                 else data.get("app_description", "")
             )
-            en_desc = smart_truncate(en_desc_raw, limit=available_for_desc)
+            description = f"⚡ Description: {en_desc_raw}"
 
-            # 5. Assemble
-            post_template_en = f"{part_top}\n⚡ Description: {en_desc}\n{part_bottom}"
+            post_template_en = generate_safe_caption(
+                header=header,
+                description=description,
+                footer_template=footer_template,
+                features=features_text,
+                modded_by_line=modded_by_line,
+            )
 
         # Prepare files list
         files_to_send = data.get("app_files", [])
         if not files_to_send and "app_file" in data:
             files_to_send = [data["app_file"]]
 
+        # Ensure images
+        images = data.get("app_images", [])
+        if not images and "app_image" in data:
+            images = [data["app_image"]]
+
         if publish_target == "arabic" or publish_target == "both":
             channel_id = os.environ.get("ARABIC_CHANNEL_ID")
-            bot.send_photo(
-                chat_id=channel_id, photo=data["app_image"], caption=post_template_ar
-            )
 
             last_msg_id = None
+            if len(images) > 1:
+                media = []
+                media.append(InputMediaPhoto(images[0], caption=post_template_ar))
+                for img in images[1:]:
+                    media.append(InputMediaPhoto(img))
+                msgs = bot.send_media_group(chat_id=channel_id, media=media)
+                last_msg_id = msgs[-1].message_id
+            else:
+                sent = bot.send_photo(
+                    chat_id=channel_id, photo=images[0], caption=post_template_ar
+                )
+                last_msg_id = sent.message_id
+
             for file_id in files_to_send:
-                sent_doc = bot.send_document(chat_id=channel_id, document=file_id)
+                # Generate caption with clean app name
+                app_name = data.get("app_name", "File")
+                clean_name = get_clean_filename(app_name)
+                file_caption = f"{clean_name}\n@premium_techs\n@premium_techs_EN"
+                sent_doc = bot.send_document(chat_id=channel_id, document=file_id, caption=file_caption)
                 last_msg_id = sent_doc.message_id
 
             if last_msg_id:
                 try:
+                    poll_options = [InputPollOption(opt) for opt in get_text("poll_options", "ar")]
                     bot.send_poll(
                         chat_id=channel_id,
                         question=get_text("poll_question", "ar"),
-                        options=get_text("poll_options", "ar"),
+                        options=poll_options,
                         is_anonymous=True,
-                        reply_to_message_id=last_msg_id,
+                        reply_parameters=ReplyParameters(message_id=last_msg_id),
                     )
                 except Exception as e:
                     print(f"Error sending poll: {e}")
 
         if publish_target == "english" or publish_target == "both":
             channel_id = os.environ.get("ENGLISH_CHANNEL_ID")
-            bot.send_photo(
-                chat_id=channel_id, photo=data["app_image"], caption=post_template_en
-            )
 
             last_msg_id = None
+            if len(images) > 1:
+                media = []
+                media.append(InputMediaPhoto(images[0], caption=post_template_en))
+                for img in images[1:]:
+                    media.append(InputMediaPhoto(img))
+                msgs = bot.send_media_group(chat_id=channel_id, media=media)
+                last_msg_id = msgs[-1].message_id
+            else:
+                sent = bot.send_photo(
+                    chat_id=channel_id, photo=images[0], caption=post_template_en
+                )
+                last_msg_id = sent.message_id
+
             for file_id in files_to_send:
-                sent_doc = bot.send_document(chat_id=channel_id, document=file_id)
+                # Generate caption with clean app name
+                app_name = data.get("app_name", "File")
+                clean_name = get_clean_filename(app_name)
+                file_caption = f"{clean_name}\n@premium_techs"
+                sent_doc = bot.send_document(chat_id=channel_id, document=file_id, caption=file_caption)
                 last_msg_id = sent_doc.message_id
 
             if last_msg_id:
                 try:
+                    poll_options = [InputPollOption(opt) for opt in get_text("poll_options", "en")]
                     bot.send_poll(
                         chat_id=channel_id,
                         question=get_text("poll_question", "en"),
-                        options=get_text("poll_options", "en"),
+                        options=poll_options,
                         is_anonymous=True,
-                        reply_to_message_id=last_msg_id,
+                        reply_parameters=ReplyParameters(message_id=last_msg_id),
                     )
                 except Exception as e:
                     print(f"Error sending poll: {e}")
@@ -1753,6 +2131,8 @@ def admin_cancel_rejection_callback(call):
 
 @bot.message_handler(state=BotStates.admin_rejection_reason)
 def admin_rejection_reason_handler(message):
+    if message.text and message.text.startswith('/'):
+        return
     admin_id = message.from_user.id
 
     # Retrieve rejection details
@@ -1781,11 +2161,12 @@ def admin_rejection_reason_handler(message):
 
     original_poster_id = target_user_id
 
-    notification_text = get_text("rejection_notification") + rejection_reason
-    try:
-        bot.send_message(original_poster_id, notification_text)
-    except Exception as e:
-        print(f"Error sending rejection to user {original_poster_id}: {e}")
+    # Removed initial notification in favor of the one with the button below.
+    # notification_text = get_text("rejection_notification") + rejection_reason
+    # try:
+    #     bot.send_message(original_poster_id, notification_text)
+    # except Exception as e:
+    #     print(f"Error sending rejection to user {original_poster_id}: {e}")
 
     # Action 2: Edit Admin Message
     if reject_message_id:
@@ -1803,10 +2184,20 @@ def admin_rejection_reason_handler(message):
     # Action 3: Cleanup
     bot.send_message(message.chat.id, get_text("rejection_sent"))
 
-    # Clear user data for the rejected submission
-    if target_user_id in user_data:
-        del user_data[target_user_id]
-        bot.delete_state(target_user_id)  # Also clear their state if any
+    # Update Rejection Message to User (Add Edit & Retry Button)
+    retry_markup = InlineKeyboardMarkup()
+    retry_markup.add(InlineKeyboardButton("✏️ Edit & Retry", callback_data="retry_submission"))
+    try:
+        bot.send_message(
+            original_poster_id,
+            get_text("rejection_notification") + rejection_reason,
+            reply_markup=retry_markup
+        )
+    except Exception as e:
+        print(f"Error sending retry button to user: {e}")
+
+    # Note: We DO NOT delete user_data[target_user_id] so they can retry.
+    # We only clear admin temp data.
 
     # Clear admin temp data and state
     user_data[admin_id].pop("rejecting_target", None)
@@ -1869,7 +2260,7 @@ def auto_mirror_channel_post(message):
                 original_poll = message.poll
 
                 english_question = get_text("poll_question", "en")
-                english_options = get_text("poll_options", "en")
+                english_options = [InputPollOption(opt) for opt in get_text("poll_options", "en")]
 
                 bot.send_poll(
                     chat_id=english_channel_id,
@@ -1887,3 +2278,322 @@ def auto_mirror_channel_post(message):
 
     except Exception as e:
         print(f"Error in auto-mirroring: {e}")
+
+def show_edit_menu(chat_id, user_id, message_id=None):
+    """
+    Displays the Edit Hub/Menu for the user to modify specific fields of their submission.
+    """
+    bot.set_state(user_id, BotStates.edit_menu, chat_id)
+    data = user_data.get(user_id, {})
+
+    # Basic Summary
+    summary = (
+        f"📝 **Edit Submission**\n\n"
+        f"📌 **Name:** {escape_markdown(data.get('app_name', 'N/A'))}\n"
+        f"🔢 **Version:** {escape_markdown(data.get('app_version', 'N/A'))}\n"
+        f"📄 **Desc:** {escape_markdown(smart_truncate(data.get('app_description', 'N/A'), 50))}\n"
+        f"🏷 **Hashtag:** {escape_markdown(data.get('hashtag', 'N/A'))}\n"
+    )
+
+    markup = InlineKeyboardMarkup(row_width=2)
+
+    # Edit Buttons
+    markup.add(
+        InlineKeyboardButton("📝 الاسم", callback_data="edit_field_name"),
+        InlineKeyboardButton("🔢 الإصدار", callback_data="edit_field_version"),
+        InlineKeyboardButton("📄 الوصف", callback_data="edit_field_desc"),
+        InlineKeyboardButton("✨ الميزات", callback_data="edit_field_features"),
+        InlineKeyboardButton("🏷️ الهاشتاج", callback_data="edit_field_hashtag"),
+        InlineKeyboardButton("🖼 الصورة", callback_data="edit_field_image"),
+        InlineKeyboardButton(get_text("btn_add_images"), callback_data="trigger_add_images"),
+        InlineKeyboardButton("📁 الملفات", callback_data="edit_field_file"),
+    )
+
+    # Resubmit Button
+    markup.add(InlineKeyboardButton("✅ إعادة الإرسال", callback_data="edit_resubmit"))
+
+    if message_id:
+        try:
+            bot.delete_message(chat_id, message_id)
+        except Exception:
+            pass
+        bot.send_message(chat_id, summary, reply_markup=markup, parse_mode="Markdown")
+    else:
+        bot.send_message(chat_id, summary, reply_markup=markup, parse_mode="Markdown")
+
+
+@bot.callback_query_handler(func=lambda call: call.data == "trigger_edit_menu")
+def trigger_edit_menu_callback(call):
+    user_id = call.from_user.id
+    chat_id = call.message.chat.id
+
+    # --- RECOVERY MODE (For Vercel Stateless Environment) ---
+    if user_id not in user_data or not user_data[user_id]:
+        try:
+            caption = call.message.caption or ""
+            user_data[user_id] = {}
+
+            # Regex Recovery
+            def extract(label, default="N/A"):
+                match = re.search(rf"{label}\s*(.*)", caption)
+                return match.group(1).strip() if match else default
+
+            user_data[user_id]["app_type"] = extract("نوع التطبيق:")
+            user_data[user_id]["source"] = extract("المصدر:")
+            user_data[user_id]["publish_target"] = extract("وجهة النشر:")
+            user_data[user_id]["app_name"] = extract("اسم التطبيق:")
+            user_data[user_id]["app_version"] = extract("إصدار التطبيق:")
+
+            # Description (Multiline, ends at hashtag label or EOF)
+            desc_match = re.search(r"وصف التطبيق:\s*(.*?)\nالهاشتاج:", caption, re.DOTALL)
+            user_data[user_id]["app_description"] = (
+                desc_match.group(1).strip() if desc_match else "N/A"
+            )
+
+            user_data[user_id]["hashtag"] = extract("الهاشتاج:")
+
+            modded_by = extract("🛑 تم التعديل بواسطة :", default=None)
+            if modded_by:
+                user_data[user_id]["modded_by"] = modded_by
+
+            # Defaults
+            user_data[user_id]["post_type"] = "app"
+            user_data[user_id]["original_poster_id"] = user_id
+            user_data[user_id]["app_files"] = []
+
+            # Recover Image (Using file_id from message)
+            # For Option A (Text Message), photo is None, so list is empty.
+            if call.message.photo:
+                user_data[user_id]["app_images"] = [call.message.photo[-1].file_id]
+            else:
+                user_data[user_id]["app_images"] = []
+
+            if DEBUG_MODE:
+                print(
+                    f"DEBUG: Recovered state for {user_id}: {user_data[user_id]}",
+                    file=sys.stderr,
+                )
+
+        except Exception as e:
+            if DEBUG_MODE:
+                print(f"Recovery failed: {e}", file=sys.stderr)
+            # If recovery crashes, we proceed with whatever we have (or empty)
+
+    # Enable edit mode
+    if user_id in user_data:
+        user_data[user_id]["edit_mode"] = True
+
+    bot.answer_callback_query(call.id)
+    show_edit_menu(chat_id, user_id, call.message.message_id)
+
+
+@bot.callback_query_handler(func=lambda call: call.data == "retry_submission")
+def retry_submission_callback(call):
+    user_id = call.from_user.id
+    if user_id not in user_data:
+         bot.answer_callback_query(call.id, "Session expired.", show_alert=True)
+         return
+
+    user_data[user_id]['edit_mode'] = True
+    bot.answer_callback_query(call.id, "Editing mode enabled.")
+    show_edit_menu(call.message.chat.id, user_id)
+
+
+@bot.callback_query_handler(func=lambda call: call.data.startswith("edit_field_") or call.data == "edit_resubmit")
+def edit_menu_callback(call):
+    user_id = call.from_user.id
+    action = call.data
+    chat_id = call.message.chat.id
+
+    if user_id not in user_data:
+        bot.answer_callback_query(call.id, "Session expired.", show_alert=True)
+        return
+
+    bot.answer_callback_query(call.id)
+
+    if action == "edit_resubmit":
+        # Check Images
+        images = user_data[user_id].get("app_images", [])
+        if not images and "app_image" in user_data[user_id]:
+            images = [user_data[user_id]["app_image"]]
+
+        if not images:
+            bot.answer_callback_query(call.id, "⚠️ الصور مفقودة!", show_alert=True)
+            bot.send_message(call.message.chat.id, "⚠️ تنبيه: الصور مفقودة. الرجاء إعادة رفع صور التطبيق.")
+            ask_app_image(call.message.chat.id, user_id)
+            return
+
+        files = user_data[user_id].get("app_files", [])
+        if not files:
+            bot.answer_callback_query(call.id, "⚠️ يجب رفع ملفات!", show_alert=True)
+            bot.send_message(call.message.chat.id, "⚠️ تنبيه: الملفات مفقودة (بسبب تحديث الجلسة). الرجاء إعادة رفع ملفات التطبيق قبل الإرسال.")
+            ask_app_file(call.message.chat.id, user_id)
+            return
+
+        # Turn off edit mode and go to confirmation
+        user_data[user_id]['edit_mode'] = False
+        ask_confirmation(chat_id, user_id)
+        return
+
+    # Field Routing
+    if action == "edit_field_name":
+        ask_app_name(chat_id, user_id)
+    elif action == "edit_field_version":
+        ask_app_version(chat_id, user_id)
+    elif action == "edit_field_desc":
+        ask_app_description(chat_id, user_id)
+    elif action == "edit_field_features":
+        # Reset current features to allow fresh selection or keep them?
+        # Instructions say "Modify". Usually simpler to keep existing set.
+        # But `ask_mod_features` uses `user_data[user_id]["selected_features"]`.
+        # Ensure it exists.
+        if "selected_features" not in user_data[user_id]:
+             user_data[user_id]["selected_features"] = set()
+        ask_mod_features(chat_id, user_id)
+    elif action == "edit_field_hashtag":
+        ask_hashtag(chat_id, user_id)
+    elif action == "edit_field_image":
+        ask_app_image(chat_id, user_id)
+    elif action == "edit_field_file":
+        # Special rule: Clear old files for replacement
+        if "app_files" in user_data[user_id]:
+            del user_data[user_id]["app_files"]
+        if "app_file" in user_data[user_id]:
+            del user_data[user_id]["app_file"]
+        ask_app_file(chat_id, user_id)
+
+
+@bot.callback_query_handler(func=lambda call: call.data == "trigger_add_images")
+def trigger_add_images_callback(call):
+    user_id = call.from_user.id
+
+    # Auto-Fill Commit Logic
+    if user_id in user_data and "app_name" not in user_data[user_id] and "temp_autofill" in user_data[user_id]:
+        temp = user_data[user_id]["temp_autofill"]
+        user_data[user_id].update(
+            {
+                "app_name": temp["name"],
+                "app_description": temp["translated_ar_desc"],
+                "auto_filled": True,
+            }
+        )
+        # Ensure post_type exists (default to app if missing)
+        if "post_type" not in user_data[user_id]:
+            user_data[user_id]["post_type"] = "app"
+
+        # Handle Icon
+        if temp["icon"].startswith("http"):
+            try:
+                img_resp = requests.get(temp["icon"])
+                if img_resp.status_code == 200:
+                    photo_file = io.BytesIO(img_resp.content)
+                    photo_file.name = "icon.jpg"
+                    # We must send it to get a file_id, but we are inside a callback.
+                    # Send a temporary message.
+                    sent_msg = bot.send_photo(
+                        call.message.chat.id, photo_file, caption=f"✅ {temp['name']}"
+                    )
+                    user_data[user_id]["app_images"] = [sent_msg.photo[-1].file_id]
+                else:
+                    bot.send_message(
+                        call.message.chat.id,
+                        "⚠️ Failed to download icon. Please upload it manually.",
+                    )
+                    user_data[user_id]["app_images"] = []
+            except Exception as e:
+                print(f"Image download error: {e}")
+                user_data[user_id]["app_images"] = []
+        else:
+            user_data[user_id]["app_images"] = [temp["icon"]]
+            bot.send_photo(
+                call.message.chat.id, temp["icon"], caption=f"✅ {temp['name']}"
+            )
+
+        # Handle English Description
+        publish_target = user_data[user_id].get("publish_target")
+        if publish_target in ["english", "both"]:
+            if temp.get("is_desc_edited"):
+                try:
+                    eng_desc = GoogleTranslator(source="ar", target="en").translate(
+                        temp["translated_ar_desc"]
+                    )
+                    user_data[user_id]["english_description"] = eng_desc
+                except Exception as e:
+                    print(f"Auto-translate error: {e}")
+                    user_data[user_id]["english_description"] = temp[
+                        "translated_ar_desc"
+                    ]
+            else:
+                user_data[user_id]["english_description"] = temp.get("scraped_en_desc")
+
+        # Delete the preview message
+        try:
+            bot.delete_message(call.message.chat.id, call.message.message_id)
+        except Exception:
+            pass
+
+    bot.set_state(user_id, BotStates.adding_more_images, call.message.chat.id)
+
+    # Ensure app_images is a list
+    if user_id in user_data:
+        if "app_images" not in user_data[user_id]:
+            if "app_image" in user_data[user_id]:
+                user_data[user_id]["app_images"] = [user_data[user_id]["app_image"]]
+            else:
+                user_data[user_id]["app_images"] = []
+    else:
+        # Session expired safe-guard
+        bot.answer_callback_query(call.id, "Session expired.", show_alert=True)
+        return
+
+    bot.answer_callback_query(call.id)
+
+    markup = ReplyKeyboardMarkup(resize_keyboard=True, one_time_keyboard=True)
+    markup.add(KeyboardButton("✅ تم"), KeyboardButton(get_text("back_button")))
+
+    bot.send_message(
+        call.message.chat.id,
+        get_text("ask_add_images"),
+        reply_markup=markup
+    )
+
+
+@bot.message_handler(state=BotStates.adding_more_images, content_types=["photo", "text"])
+def adding_more_images_handler(message):
+    user_id = message.from_user.id
+
+    if message.content_type == "text":
+        if message.text == "✅ تم" or message.text == get_text("back_button"):
+            if user_data[user_id].get("edit_mode"):
+                # User was editing an existing full submission -> Return to Hub
+                bot.set_state(user_id, BotStates.edit_menu, message.chat.id)
+                show_edit_menu(message.chat.id, user_id)
+            else:
+                # User is in Initial Wizard (Auto-Fill flow) -> Continue Wizard
+                ask_app_version(message.chat.id, user_id)
+            return
+
+    elif message.content_type == "photo":
+        if user_id not in user_data:
+             bot.send_message(message.chat.id, "Session expired.")
+             return
+
+        if "app_images" not in user_data[user_id]:
+             user_data[user_id]["app_images"] = []
+
+        if len(user_data[user_id]["app_images"]) >= 10:
+             bot.send_message(message.chat.id, "⚠️ Limit reached (10). Press Done.")
+             return
+
+        user_data[user_id]["app_images"].append(message.photo[-1].file_id)
+
+        count = len(user_data[user_id]["app_images"])
+        msg = get_text("images_added").format(count=1, total=count)
+        bot.send_message(message.chat.id, msg)
+
+
+@bot.message_handler(func=lambda m: True)
+def debug_catch_all(message):
+    if DEBUG_MODE:
+        print(f"DEBUG: Catch-all triggered for text: {message.text}", file=sys.stderr)
+    # bot.reply_to(message, "Debug: Catch-all") # Keep commented out
