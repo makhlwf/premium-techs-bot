@@ -910,7 +910,7 @@ def ask_confirmation(chat_id, user_id):
         # Generate caption with clean app name
         app_name = data.get("app_name", "File")
         clean_name = get_clean_filename(app_name)
-        file_caption = f"{clean_name}\n@premium_techs\n@premium_techs_EN"
+        file_caption = f"{clean_name}\n@premium_techs"
         bot.send_document(chat_id=chat_id, document=file_id, caption=file_caption)
 
 
@@ -2009,7 +2009,7 @@ def admin_approval_callback(call):
                 # Generate caption with clean app name
                 app_name = data.get("app_name", "File")
                 clean_name = get_clean_filename(app_name)
-                file_caption = f"{clean_name}\n@premium_techs\n@premium_techs_EN"
+                file_caption = f"{clean_name}\n@premium_techs"
                 sent_doc = bot.send_document(chat_id=channel_id, document=file_id, caption=file_caption)
                 last_msg_id = sent_doc.message_id
 
@@ -2047,7 +2047,7 @@ def admin_approval_callback(call):
                 # Generate caption with clean app name
                 app_name = data.get("app_name", "File")
                 clean_name = get_clean_filename(app_name)
-                file_caption = f"{clean_name}\n@premium_techs"
+                file_caption = f"{clean_name}\n@premium_techs_en"
                 sent_doc = bot.send_document(chat_id=channel_id, document=file_id, caption=file_caption)
                 last_msg_id = sent_doc.message_id
 
